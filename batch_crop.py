@@ -60,48 +60,86 @@ def setup_desc(desc, buf, buf_size, width, height, width_stride, height_stride):
     acl.media.dvpp_set_pic_desc_height_stride(desc, height_stride)
 
 
-def batch_crop(yuv, width, height, boxes, stream, dvpp_channel_desc):
+def copy_as_nparray(outputs_desc, img_count):
+    """Copy the image back to host as numpy array.
 
-    # 准备待裁切图像
+    Args:
+        outputs_desc: the DVPP batch pic desc object.
+        img_count: the number of the output images.
 
-    # 虽然你已经将YUV图像读入内存，但是硬件加速的裁切操作需要在Ascend芯片上进行，这意味着你需
-    # 要把图像数据从主机(host)一侧拷贝到Ascend芯片(Device)一侧。另外，Device一侧的数据并非
-    # Numpy数组，在这里生存的图像有自己独特的“描述方式”。
+    Returns:
+        outputs: a list of OpenCV RGB images as numpy array
+    """
+    outputs = []
+    for i in range(img_count):
+
+        # 获得裁切图像描述对象
+        output_desc = acl.media.dvpp_get_pic_desc(outputs_desc, i)
+        assert output_desc is not None
+        ret_code = acl.media.dvpp_get_pic_desc_ret_code(output_desc)
+        utils.check_ret("acl.media.dvpp_get_pic_desc_ret_code", ret_code)
+
+        # 拷贝数据到主机一侧并转换为Numpy数组。
+        data = acl.media.dvpp_get_pic_desc_data(output_desc)
+        data_size = acl.media.dvpp_get_pic_desc_size(output_desc)
+        np_pic = np.zeros(data_size, dtype=np.byte)
+        np_pic_ptr = acl.util.numpy_to_ptr(np_pic)
+        ret = acl.rt.memcpy(np_pic_ptr, data_size,
+                            data, data_size,
+                            constants.ACL_MEMCPY_DEVICE_TO_HOST)
+        utils.check_ret("acl.rt.memcpy", ret)
+
+        # 将裁切后的图像转换为RGB格式
+        width_stride = acl.media.dvpp_get_pic_desc_width_stride(output_desc)
+        height_stride = acl.media.dvpp_get_pic_desc_height_stride(output_desc)
+        result_yuv = np.reshape(
+            np_pic, (int((height_stride)*3/2), int(width_stride))).astype(np.uint8)
+        result_bgr = cv2.cvtColor(result_yuv, cv2.COLOR_YUV2BGR_NV12)
+
+        # 并去掉补齐的部分。
+        org_w = acl.media.dvpp_get_pic_desc_width(output_desc)
+        org_h = acl.media.dvpp_get_pic_desc_height(output_desc)
+        result_bgr = result_bgr[0:org_h, 0:org_w, :]
+        outputs.append(result_bgr)
+
+    return outputs
+
+
+def batch_crop(buf_yuv, buf_size, width, height, stride_width, stride_height,
+               boxes, stream, dvpp_channel_desc):
+    """从一张图像中批量裁切区域。
+
+    Args:
+        buf_yuv: 输入的yuv图像指针
+        width: 待裁切图像的宽度
+        height: 待裁切图像的高度
+        boxes: 裁切区域列表，[[x1, x2, y1, y2], ...]
+        stream: ACL stream
+        dvpp_channel_desc: DVPP channel desc
+
+    Returns:
+        outputs: 裁切后的RGB图像列表，图像为Numpy数组。
+    """
     box_count = len(boxes)
     image_count = 1
-
-    roi_num_list = []
-    corp_area_list = []
 
     # 创建图片批处理输入输出描述
     inputs_desc = acl.media.dvpp_create_batch_pic_desc(image_count)
     outputs_desc = acl.media.dvpp_create_batch_pic_desc(box_count)
 
     # 逐个准备待处理的输入图像
-    buffers_in = []
     for i in range(image_count):
 
         # 获取单个图片描述对象
         input_desc = acl.media.dvpp_get_pic_desc(inputs_desc, i)
         assert input_desc is not None
 
-        # 为输入图像申请内存并设定描述对象
-        h, w, = height, width
-        ptr_in, buf_size, stride_w, stride_h = create_buffer(w, h, 16, 2)
-        setup_desc(input_desc, ptr_in, buf_size, w, h, stride_w, stride_h)
-
-        # 拷贝数据到Device并记录该数据位置
-        buffer_size_in = yuv.itemsize * yuv.size
-        ptr_yuv = acl.util.numpy_to_ptr(yuv)
-        ret = acl.rt.memcpy(ptr_in, buffer_size_in, ptr_yuv, buffer_size_in,
-                            constants.ACL_MEMCPY_HOST_TO_DEVICE)
-        assert ret == 0, "图像内存拷贝失败。"
-        buffers_in.append(ptr_in)
-
-        # 记录需要裁切的区域数量
-        roi_num_list.append(box_count)
+        # 设定描述对象
+        setup_desc(input_desc, buf_yuv, buf_size, width,
+                   height, stride_width, stride_height)
 
     # 逐个设置输出图片描述
+    corp_area_list = []
     buffers_out = []
     for i in range(box_count):
 
@@ -121,6 +159,9 @@ def batch_crop(yuv, width, height, boxes, stream, dvpp_channel_desc):
         crop_area = acl.media.dvpp_create_roi_config(x1, x2-1, y1, y2-1)
         corp_area_list.append(crop_area)
 
+    # 记录需要裁切的区域数量
+    roi_num_list = [box_count]
+
     # 执行异步裁切
     outputs_desc, ret = acl.media.dvpp_vpc_batch_crop_async(
         dvpp_channel_desc,
@@ -135,39 +176,8 @@ def batch_crop(yuv, width, height, boxes, stream, dvpp_channel_desc):
     ret = acl.rt.synchronize_stream(stream)
     utils.check_ret("acl.rt.synchronize_stream", ret)
 
-    # 查阅结果。
-
-    # 获取裁切后的图像信息。这一步需要将YUV420SP转换为BGR格式。
-    outputs = []
-    for i in range(box_count):
-        
-        # 获得裁切图像描述对象
-        output_desc = acl.media.dvpp_get_pic_desc(outputs_desc, i)
-        assert output_desc is not None
-        ret_code = acl.media.dvpp_get_pic_desc_ret_code(output_desc)
-        utils.check_ret("acl.media.dvpp_get_pic_desc_ret_code", ret_code)
-
-        # 获取裁切后的图像信息
-        data = acl.media.dvpp_get_pic_desc_data(output_desc)
-        data_size = acl.media.dvpp_get_pic_desc_size(output_desc)
-        width_stride = acl.media.dvpp_get_pic_desc_width_stride(output_desc)
-        height_stride = acl.media.dvpp_get_pic_desc_height_stride(output_desc)
-
-        # 拷贝数据到主机一侧并转换为Numpy数组。
-        np_pic = np.zeros(data_size, dtype=np.byte)
-        np_pic_ptr = acl.util.numpy_to_ptr(np_pic)
-        ret = acl.rt.memcpy(np_pic_ptr, data_size,
-                            data, data_size,
-                            constants.ACL_MEMCPY_DEVICE_TO_HOST)
-        utils.check_ret("acl.rt.memcpy", ret)
-
-        result_yuv = np.reshape(
-            np_pic, (int((height_stride)*3/2), int(width_stride))).astype(np.uint8)
-        result_bgr = cv2.cvtColor(result_yuv, cv2.COLOR_YUV2BGR_NV12)
-        org_w = acl.media.dvpp_get_pic_desc_width(output_desc)
-        org_h = acl.media.dvpp_get_pic_desc_height(output_desc)
-        result_bgr = result_bgr[0:org_h, 0:org_w, :]
-        outputs.append(result_bgr)
+    # 后处理裁切后的图像信息，准备返回。
+    outputs = copy_as_nparray(outputs_desc, box_count)
 
     # 收尾、释放资源
 
@@ -179,11 +189,6 @@ def batch_crop(yuv, width, height, boxes, stream, dvpp_channel_desc):
     for i in range(len(corp_area_list)):
         ret = acl.media.dvpp_destroy_roi_config(corp_area_list[i])
         assert ret == 0, "释放ROI错误。"
-
-    # 释放Device侧内存
-    for p in buffers_in:
-        ret = acl.media.dvpp_free(p)
-        assert ret == 0, "释放输入内存错误。"
 
     for p in buffers_out:
         ret = acl.media.dvpp_free(p)
@@ -233,38 +238,50 @@ def main():
 
     # 读入一张YUV图像。
     img_file = "wood_rabbit_1024_1068_nv12.yuv"
+    height, width = 1072, 1024
     yuv = np.fromfile(img_file, dtype=np.byte)
 
-    # 为了验证读取结果，将读入的YUV图像转换为你熟悉的OpenCV图像：NumpyArray。并在窗口中查看
-    # 图像内容。
-    yuv = np.reshape(yuv, (int((1072)*3/2), int(1024))).astype(np.uint8)
-    bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12)
+    # 为输入图像申请内存并设定描述对象
+    ptr_in, buf_size, stride_w, stride_h = create_buffer(width, height, 16, 2)
+
+    # 拷贝数据到Device并记录该数据位置
+    buf_size_yuv = yuv.itemsize * yuv.size
+    ptr_yuv = acl.util.numpy_to_ptr(yuv)
+    ret = acl.rt.memcpy(ptr_in, buf_size_yuv, ptr_yuv, buf_size_yuv,
+                        constants.ACL_MEMCPY_HOST_TO_DEVICE)
+    assert ret == 0, "图像内存拷贝失败。"
 
     # 第三步：图像裁切
 
     # 指定批量裁切区域。
     boxes = [[421, 421+348, 441, 441+259],
-             [359, 359+255, 369, 369+257], 
-             [462, 462+255, 521, 523+257],]
-    height, width, _ = bgr.shape
+             [359, 359+255, 369, 369+257],
+             [462, 462+255, 521, 523+257], ]
 
     # 开始裁切
-    outputs = batch_crop(yuv, width, height, boxes, stream, dvpp_channel_desc)
+    outputs = batch_crop(ptr_in, buf_size, width, height,
+                         stride_w, stride_h, boxes, stream, dvpp_channel_desc)
 
-    # 查看裁切结果
+    # 在窗口中查看裁切前后的图像。
     for i, img in enumerate(outputs):
         cv2.imshow('Crop_{}'.format(i), img)
+    _yuv = np.reshape(yuv, (int((height)*3/2), int(width))).astype(np.uint8)
+    bgr = cv2.cvtColor(_yuv, cv2.COLOR_YUV2BGR_NV12)
     cv2.imshow('Original', bgr)
     cv2.waitKey()
 
     # 第四步：收尾、释放资源
 
+    # 释放Device侧内存
+    ret = acl.media.dvpp_free(ptr_in)
+    assert ret == 0, "释放输入内存错误。"
+
     # 释放操作通道
     if dvpp_channel_desc:
         ret = acl.media.dvpp_destroy_channel(dvpp_channel_desc)
-        assert ret == 0
+        assert ret == 0, "释放通道错误"
         ret = acl.media.dvpp_destroy_channel_desc(dvpp_channel_desc)
-        assert ret == 0
+        assert ret == 0, "释放通道描述错误"
 
     # 解码结束后，释放资源，包括输入/输出图片的描述信息、输入/输出内存、通道描述信息、通道等
     # 释放运行管理资源
