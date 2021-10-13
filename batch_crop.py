@@ -7,33 +7,50 @@ import atlas.common.atlas_utils.constants as constants
 import atlas.common.atlas_utils.utils as utils
 
 
-def setup_desc(desc, width, height, w_align=16, h_align=2, buf=None):
-    """Setup the image description object.
+def create_buffer(width, height, align_w=16, align_h=2):
+    """Create an alinged buffer for image.
 
-    The image should be in YUV420SP format.
+    Buffer size will be width_stride * height_stride, which may be larger than
+    width * height.
 
     Args:
-        desc: the image description.
-        width: the width of the image.
-        height: the height of the image.
-        w_align: the width align factor.
-        h_align: the height align factor.
+        width: image width.
+        height: image height.
+        align_w: the width unit for alignement.
+        align_h: the height unit for alignement.
 
     Returns:
-        ptr_on_device: the pointer of the image on the device.
+        ptr_on_device: pointer on the device.
+        buf_size: the buffer size.
+        width_stride: the width of the image after alignment.
+        height_stride: the height of the image after alignment.
     """
     # Calculate buffer size.
-    width_stride = ((width + w_align - 1) // w_align) * w_align
-    height_stride = ((height + h_align - 1) // h_align) * h_align
+    width_stride = utils.align_up(width, align_w)
+    height_stride = utils.align_up(height, align_h)
     buf_size = (width_stride * height_stride * 3) // 2
 
     # Allocate memory
-    if buf is None:
-        ptr_on_device, ret = acl.media.dvpp_malloc(buf_size)
-        utils.check_ret("acl.media.dvpp_malloc", ret)
+    ptr_on_device, ret = acl.media.dvpp_malloc(buf_size)
+    utils.check_ret("acl.media.dvpp_malloc", ret)
 
-    # Setup the image.
-    acl.media.dvpp_set_pic_desc_data(desc, ptr_on_device)
+    return ptr_on_device, buf_size, width_stride, height_stride
+
+
+def setup_desc(desc, buf, buf_size, width, height, width_stride, height_stride):
+    """Setup the image description object.
+
+    The image SHOULD be in YUV420SP format.
+
+    Args:
+        desc: the image description.
+        buf: image pointer.
+        width: the width of the image.
+        height: the height of the image.
+        width_stride: the width_stride of the image.
+        height_stride: the height_stride of the image.
+    """
+    acl.media.dvpp_set_pic_desc_data(desc, buf)
     acl.media.dvpp_set_pic_desc_size(desc, buf_size)
     acl.media.dvpp_set_pic_desc_format(
         desc, constants.PIXEL_FORMAT_YUV_SEMIPLANAR_420)
@@ -42,140 +59,89 @@ def setup_desc(desc, width, height, w_align=16, h_align=2, buf=None):
     acl.media.dvpp_set_pic_desc_width_stride(desc, width_stride)
     acl.media.dvpp_set_pic_desc_height_stride(desc, height_stride)
 
-    return ptr_on_device
 
+def batch_crop(yuv, width, height, boxes, stream, dvpp_channel_desc):
 
-def main():
-    # 初始化。Ascend设备上运行至少需要初始化4个对象：ACL、Device、Context和Stream。这个过
-    # 程对于Python开发者可能比较陌生。好在这个过程是一次性的。
-
-    # ACL初始化。ACL是操作Ascend设备的Python库，有点像OpenCV。
-    ret = acl.init()
-    assert ret == 0, "初始化ACL失败。"
-
-    # Device初始化。一张Atlas加速卡上可能有多个Ascend芯片可以使用。在这里指定你要选用的芯片
-    # 序号。
-    device_id = 0
-    ret = acl.rt.set_device(device_id)
-    assert ret == 0, "初始化Device失败。"
-
-    # Context初始化。Context可以看做是程序运行的小环境，它起着隔离作用。
-    context, ret = acl.rt.create_context(device_id)
-    assert ret == 0, "初始化Context失败。"
-
-    # Stream初始化。Stream多用作程序执行的同步。
-    stream, ret = acl.rt.create_stream()
-    assert ret == 0, "初始化Stream失败。"
-
-    # 成功执行到这一步，初始化完成。
-
-    # 第二步：图像读入
-
-    # ACL中专门为图像相关操作提供了硬件加速模块。这些加速有一个前提条件：图像需要为YUV格式。
-    # 另外请注意，OpenCV暂时无法将BGR图像转换为ACL支持的YUV420SP格式。所以我们将直接读入一
-    # 张YUV图像。
-
-    # 读入一张YUV图像。
-    img_file = "wood_rabbit_1024_1068_nv12.yuv"
-    org_yuv = np.fromfile(img_file, dtype=np.byte)
-
-    # 为了验证读取结果，将读入的YUV图像转换为你熟悉的OpenCV图像：NumpyArray。并在窗口中查看
-    # 图像内容。
-    org_yuv = np.reshape(
-        org_yuv, (int((1072)*3/2), int(1024))).astype(np.uint8)
-    org_bgr = cv2.cvtColor(org_yuv, cv2.COLOR_YUV2BGR_NV12)
-
-    # 第三步：图像裁切
-
-    # 如果你熟悉OpenCV的话，图像裁切可以通过数组slice的方式一行代码搞定。但是在ACL中，图像并
-    # 不是以NumpyArray的形式存储。所以你无法通过slice的方式裁切图像，而只能依赖ACL提供的API。
-    # 完成一次裁切分为以下几步：
-
-    # 1. 准备待裁切图像
+    # 准备待裁切图像
 
     # 虽然你已经将YUV图像读入内存，但是硬件加速的裁切操作需要在Ascend芯片上进行，这意味着你需
     # 要把图像数据从主机(host)一侧拷贝到Ascend芯片(Device)一侧。另外，Device一侧的数据并非
     # Numpy数组，在这里生存的图像有自己独特的“描述方式”。
-    box_count = 2
+    box_count = len(boxes)
     image_count = 1
 
     roi_num_list = []
-    corpList = []
-    pasteList = []
+    corp_area_list = []
 
-    # 3.创建图片批处理输入输出描述
-    outputs_desc = acl.media.dvpp_create_batch_pic_desc(box_count)
+    # 创建图片批处理输入输出描述
     inputs_desc = acl.media.dvpp_create_batch_pic_desc(image_count)
+    outputs_desc = acl.media.dvpp_create_batch_pic_desc(box_count)
 
-    # 指定批量抠图区域的位置、指定批量贴图区域的位置
-    boxes = [[0, 34, 0, 256],
-             [0, 34, 0, 256], ]
-
-    # 3.2 设置输入输出图片描述
+    # 逐个准备待处理的输入图像
+    buffers_in = []
     for i in range(image_count):
+
+        # 获取单个图片描述对象
         input_desc = acl.media.dvpp_get_pic_desc(inputs_desc, i)
         assert input_desc is not None
 
-        # 申请内存并设置输出图片描述
-        h, w, _ = org_bgr.shape
-        intput_ptr = setup_desc(input_desc, w, h)
+        # 为输入图像申请内存并设定描述对象
+        h, w, = height, width
+        ptr_in, buf_size, stride_w, stride_h = create_buffer(w, h, 16, 2)
+        setup_desc(input_desc, ptr_in, buf_size, w, h, stride_w, stride_h)
 
-        # copy from host to device
-        in_buffer_size = org_yuv.itemsize * org_yuv.size
-        np_yuv_ptr = acl.util.numpy_to_ptr(org_yuv)
-        ret = acl.rt.memcpy(intput_ptr, in_buffer_size,
-                            np_yuv_ptr, in_buffer_size,
+        # 拷贝数据到Device并记录该数据位置
+        buffer_size_in = yuv.itemsize * yuv.size
+        ptr_yuv = acl.util.numpy_to_ptr(yuv)
+        ret = acl.rt.memcpy(ptr_in, buffer_size_in, ptr_yuv, buffer_size_in,
                             constants.ACL_MEMCPY_HOST_TO_DEVICE)
         assert ret == 0, "图像内存拷贝失败。"
+        buffers_in.append(ptr_in)
 
-        # 创建roiNums,每张图对应需要抠图和贴图的数量
-        roi_num_list.append(box_count // image_count)
+        # 记录需要裁切的区域数量
+        roi_num_list.append(box_count)
 
+    # 逐个设置输出图片描述
+    buffers_out = []
     for i in range(box_count):
+
+        # 获取输出图像描述对象
         output_desc = acl.media.dvpp_get_pic_desc(outputs_desc, i)
         assert output_desc is not None
 
         # 自定义方法申请内存并设置输出图片描述
-        x1, x2, y1, y2 = boxes[i]
+        x1, x2, y1, y2 = map(utils.align_up, boxes[i])
         w = x2 - x1
         h = y2 - y1
-        setup_desc(output_desc, w, h)
+        ptr_out, buf_size, stride_w, stride_h = create_buffer(w, h, 16, 2)
+        setup_desc(output_desc, ptr_out, buf_size, w, h, stride_w, stride_h)
+        buffers_out.append(ptr_out)
+
+        # 设定裁切区域
         crop_area = acl.media.dvpp_create_roi_config(x1, x2-1, y1, y2-1)
+        corp_area_list.append(crop_area)
 
-        corpList.append(crop_area)
-
-    # 3.3 roiList,每张图对应需要抠图和贴图的数量。输出图片数相对输入多出来的，加到最后一张输入图片的输出。
-    total_num = 0
-    for i in range(image_count):
-        total_num += roi_num_list[i]
-
-    if box_count % image_count != 0:
-        roi_num_list[-1] = box_count - total_num + roi_num_list[-1]
-
-    # 4.创建图片数据处理通道时的通道描述信息，dvppChannelDesc_是acldvppChannelDesc类型
-    dvpp_channel_desc = acl.media.dvpp_create_channel_desc()
-
-    # 5.创建图片数据处理的通道。
-    ret = acl.media.dvpp_create_channel(dvpp_channel_desc)
-
-    # 6.执行异步缩放，再调用acl.rt.synchronize_stream接口阻塞程序运行，直到指定Stream中的所有任务都完成
+    # 执行异步裁切
     outputs_desc, ret = acl.media.dvpp_vpc_batch_crop_async(
         dvpp_channel_desc,
         inputs_desc,
         roi_num_list,
         outputs_desc,
-        corpList,
+        corp_area_list,
         stream)
-    _, ret = acl.media.dvpp_vpc_batch_crop_async(dvpp_channel_desc, inputs_desc,
-                                                 roi_num_list, outputs_desc, corpList,
-                                                 stream)
+    utils.check_ret("acl.media.dvpp_vpc_batch_crop_async", ret)
+
+    # 同步裁切任务结果
     ret = acl.rt.synchronize_stream(stream)
+    utils.check_ret("acl.rt.synchronize_stream", ret)
 
-    # 6. 查阅结果。
+    # 查阅结果。
 
-    # 最后，在窗口中查阅裁切前后的对比。这一步需要将YUV420SP转换为BGR格式。
-    # 获取裁切后的图像信息。
+    # 获取裁切后的图像信息。这一步需要将YUV420SP转换为BGR格式。
+    outputs = []
     for i in range(box_count):
+        
+        # 获得裁切图像描述对象
         output_desc = acl.media.dvpp_get_pic_desc(outputs_desc, i)
         assert output_desc is not None
         ret_code = acl.media.dvpp_get_pic_desc_ret_code(output_desc)
@@ -198,30 +164,100 @@ def main():
         result_yuv = np.reshape(
             np_pic, (int((height_stride)*3/2), int(width_stride))).astype(np.uint8)
         result_bgr = cv2.cvtColor(result_yuv, cv2.COLOR_YUV2BGR_NV12)
-        cv2.imshow('Original', org_bgr)
-        cv2.imshow('Cropped_{}'.format(i), result_bgr)
-    cv2.waitKey()
+        org_w = acl.media.dvpp_get_pic_desc_width(output_desc)
+        org_h = acl.media.dvpp_get_pic_desc_height(output_desc)
+        result_bgr = result_bgr[0:org_h, 0:org_w, :]
+        outputs.append(result_bgr)
 
-    # 第四步：收尾、释放资源
+    # 收尾、释放资源
 
-    # 8.解码结束后，释放资源，包括输入/输出图片的描述信息、输入/输出内存、通道描述信息、通道等
+    # 释放批量图片描述
     acl.media.dvpp_destroy_batch_pic_desc(inputs_desc)
     acl.media.dvpp_destroy_batch_pic_desc(outputs_desc)
 
-    # 7.解码结束后，释放资源，包括输入/输出图片的描述信息、输入/输出内存、通道描述信息、通道等
-    # 7.1 释放图片描述和批量图片描述
-    for i in range(len(corpList)):
-        ret = acl.media.dvpp_destroy_roi_config(corpList[i])
-        assert ret == 0
-    for i in range(len(pasteList)):
-        ret = acl.media.dvpp_destroy_roi_config(pasteList[i])
-        assert ret == 0
-    # for key in dev_buffer.keys():
-    #     if dev_buffer[key]:
-    #         ret = acl.media.dvpp_free(dev_buffer[key])
-    # 释放Device侧内存
+    # 释放ROI配置
+    for i in range(len(corp_area_list)):
+        ret = acl.media.dvpp_destroy_roi_config(corp_area_list[i])
+        assert ret == 0, "释放ROI错误。"
 
-    ret = acl.media.dvpp_free(intput_ptr)
+    # 释放Device侧内存
+    for p in buffers_in:
+        ret = acl.media.dvpp_free(p)
+        assert ret == 0, "释放输入内存错误。"
+
+    for p in buffers_out:
+        ret = acl.media.dvpp_free(p)
+        assert ret == 0, "释放输出内存错误。"
+
+    return outputs
+
+
+def main():
+    # 第一步：初始化
+
+    # Ascend设备上运行至少需要初始化4个对象：ACL、Device、Context和Stream。这个过
+    # 程对于Python开发者可能比较陌生。好在这个过程是一次性的。
+
+    # ACL初始化。ACL是操作Ascend设备的Python库，有点像OpenCV。
+    ret = acl.init()
+    assert ret == 0, "初始化ACL失败。"
+
+    # Device初始化。一张Atlas加速卡上可能有多个Ascend芯片可以使用。在这里指定你要选用的芯片
+    # 序号。
+    device_id = 0
+    ret = acl.rt.set_device(device_id)
+    assert ret == 0, "初始化Device失败。"
+
+    # Context初始化。Context可以看做是程序运行的小环境，它起着隔离作用。
+    context, ret = acl.rt.create_context(device_id)
+    assert ret == 0, "初始化Context失败。"
+
+    # Stream初始化。Stream多用作异步操作的同步。
+    stream, ret = acl.rt.create_stream()
+    assert ret == 0, "初始化Stream失败。"
+
+    # 创建图片数据处理通道时的通道描述信息。
+    dvpp_channel_desc = acl.media.dvpp_create_channel_desc()
+
+    # 创建图片数据处理的通道。
+    ret = acl.media.dvpp_create_channel(dvpp_channel_desc)
+    utils.check_ret("acl.media.dvpp_create_channel", ret)
+
+    # 成功执行到这一步，初始化完成。
+
+    # 第二步：图像读入
+
+    # ACL中专门为图像相关操作提供了硬件加速模块。这些加速有一个前提条件：图像需要为YUV格式。
+    # 另外请注意，OpenCV暂时无法将BGR图像转换为ACL支持的YUV420SP格式。所以我们将直接读入一
+    # 张YUV图像。
+
+    # 读入一张YUV图像。
+    img_file = "wood_rabbit_1024_1068_nv12.yuv"
+    yuv = np.fromfile(img_file, dtype=np.byte)
+
+    # 为了验证读取结果，将读入的YUV图像转换为你熟悉的OpenCV图像：NumpyArray。并在窗口中查看
+    # 图像内容。
+    yuv = np.reshape(yuv, (int((1072)*3/2), int(1024))).astype(np.uint8)
+    bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12)
+
+    # 第三步：图像裁切
+
+    # 指定批量裁切区域。
+    boxes = [[421, 421+348, 441, 441+259],
+             [359, 359+255, 369, 369+257], 
+             [462, 462+255, 521, 523+257],]
+    height, width, _ = bgr.shape
+
+    # 开始裁切
+    outputs = batch_crop(yuv, width, height, boxes, stream, dvpp_channel_desc)
+
+    # 查看裁切结果
+    for i, img in enumerate(outputs):
+        cv2.imshow('Crop_{}'.format(i), img)
+    cv2.imshow('Original', bgr)
+    cv2.waitKey()
+
+    # 第四步：收尾、释放资源
 
     # 释放操作通道
     if dvpp_channel_desc:
@@ -230,6 +266,7 @@ def main():
         ret = acl.media.dvpp_destroy_channel_desc(dvpp_channel_desc)
         assert ret == 0
 
+    # 解码结束后，释放资源，包括输入/输出图片的描述信息、输入/输出内存、通道描述信息、通道等
     # 释放运行管理资源
     ret = acl.rt.destroy_stream(stream)
     ret = acl.rt.destroy_context(context)
